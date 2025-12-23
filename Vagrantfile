@@ -2,27 +2,38 @@
 # vi: set ft=ruby :
 
 Vagrant.configure("2") do |config|
+  # Toggle if we want to use local files
+  # This is only really used for the dockerfile at the moment
+  use_local_files = ENV["NETBOOT_LOCAL_FILES"] == "true"
+
+  common_setup = lambda do |machine|
+    machine.vm.box = "bento/ubuntu-24.04"
+    # Bridge the VM onto your host's network
+    machine.vm.network "public_network", type: "bridged"
+    machine.vm.provider "virtualbox" do |vb|
+      # Enable promiscuous mode on Adapter 2 (the bridged public_network)
+           vb.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
+    end
+    # Was having issues with using the default sync on virtualbox on osx
+    if use_local_files
+      machine.vm.synced_folder ".", "/vagrant",
+        type: "rsync",
+        rsync__exclude: [".git/", ".github/", ".vagrant" "docs"],
+        rsync__args: ["--verbose", "--archive", "--delete", "-z"]
+    else
+      machine.vm.synced_folder ".", "/vagrant", disabled: true
+    end
+  end
+
   # Define a Vagrant machine which should PXE boot off the docker cotnainer
   config.vm.define :demo, primary: true do |demo|
-    demo.vm.box = "bento/ubuntu-20.04"
-
-    # Bridge the VM onto your host's network
-    demo.vm.network "public_network"
-
+    common_setup.call(demo)
     # Don't wait for VM to boot - it won't finish anyway
     demo.vm.boot_timeout = 5
-
     demo.vm.provider "virtualbox" do |vb|
-        # Display the GUI so we can see what it does
         vb.gui = true
-
-        # Add enough RAM to download Ubuntu live
         vb.memory = 5120
-
-        # Enable PXE boot as the only option
         vb.customize ["modifyvm", :id, "--boot1", "net"]
-
-        # Disconnect the default NIC
         vb.customize ["modifyvm", :id, "--nic1", "none"]
     end
   end
@@ -30,18 +41,21 @@ Vagrant.configure("2") do |config|
   # For platforms where the Docker container won't work, this boots a VM that
   # runs the container instead
   config.vm.define :netboot, autostart: false do |netboot|
-    netboot.vm.box = "bento/ubuntu-20.04"
-
-    # Bridge the VM onto your host's network
-    netboot.vm.network "public_network"
-
-    # Read a DHCP range from the environment, if one was set
-    dhcp_range_start = ENV.has_key?("DHCP_RANGE_START") ? ENV["DHCP_RANGE_START"] : "192.168.0.1"
-
-    # Bring up a Docker container running the netboot server
+    common_setup.call(netboot)
+    netboot.vm.provider "virtualbox" do |vb|
+           vb.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
+    end
+    dhcp_range_start = ENV.fetch("DHCP_RANGE_START", "192.168.0.1")
     netboot.vm.provision "docker" do |d|
-      d.run "samdbmg/dhcp-netboot.xyz",
-        args: "--net=host --cap-add=NET_ADMIN -e DHCP_RANGE_START=" + dhcp_range_start
+      if use_local_files
+        d.build_image "/vagrant", args: "-t local-netboot"
+        image_tag = "local-netboot"
+      else
+        image_tag = "samdbmg/dhcp-netboot.xyz"
+      end
+
+      d.run image_tag,
+        args: "--net=host --cap-add=NET_ADMIN -e DHCP_RANGE_START=#{dhcp_range_start}"
     end
   end
 
@@ -51,7 +65,4 @@ Vagrant.configure("2") do |config|
     config.proxy.https    = ENV["https_proxy"]
     config.proxy.no_proxy = ENV["no_proxy"]
   end
-
-  # Turn off shared folders, we don't need them!
-  config.vm.synced_folder '.', '/vagrant', disabled: true
 end
